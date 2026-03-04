@@ -1,7 +1,7 @@
 name: astrbot_plugin_shanghaitech_verifier
 display_name: ShanghaiTech 群助手
 desc: AstrBot 插件
-version: v1.0.0
+version: v1.1.0
 author: ZAMBAR
 repo: https://github.com/ShanghaitechGeekPie/astrbot_plugin_shanghaitech_verifier
 support_platforms:
