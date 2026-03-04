@@ -25,13 +25,13 @@ ShanghaiTech 进群学号校验插件（AIOCQHTTP）。
 
 ## 配置
 
-通过环境变量配置管理员告警群：
+通过 AstrBot 插件配置（`_conf_schema.json`）设置：
 
-```bash
-export ADMIN_GROUP=123456789
-```
+- `admin_group`：管理员告警群号（QQ 群号）
+- `debug_log`：是否输出调试日志（默认 `true`）
 
-未设置 `ADMIN_GROUP` 时，异常事件只会写日志，不会发送群告警。
+未设置 `admin_group` 时，异常事件只会写日志，不会发送群告警。
+开启 `debug_log` 后，会在日志中输出事件接收与过滤过程，便于排查“收不到消息”。
 
 ## 参考
 

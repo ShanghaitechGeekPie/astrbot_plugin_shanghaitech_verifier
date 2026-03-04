@@ -1,0 +1,12 @@
+{
+  "admin_group": {
+    "description": "管理员告警群号（QQ 群号）",
+    "type": "string",
+    "default": ""
+  },
+  "debug_log": {
+    "description": "是否输出调试日志（用于排查收不到事件）",
+    "type": "bool",
+    "default": true
+  }
+}
