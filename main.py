@@ -410,7 +410,7 @@ class ShanghaiTechVerifierPlugin(Star):
                 unverified_members.append((uid_int, display))
 
         # Build forwarded message nodes
-        bot_id = getattr(event.bot, "qq", 0) or 10000
+        bot_id = str(getattr(event.bot, "qq", 0) or 10000)
         bot_name = "群助手"
 
         # Node 1: Summary
