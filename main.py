@@ -449,12 +449,14 @@ class ShanghaiTechVerifierPlugin(Star):
 
         # Extract QQ number from command arguments
         text = event.message_str.strip()
-        parts = text.split()
-        if len(parts) < 1 or not parts[0].isdigit():
+        self._debug(f"[cmd_query] raw message_str={text!r}")
+        # Find the first sequence of digits (QQ number) in the text
+        qq_match = re.search(r"(\d{5,12})", text)
+        if not qq_match:
             yield event.plain_result("用法: /查询 <QQ号>")
             return
 
-        qq_str = parts[0]
+        qq_str = qq_match.group(1)
         try:
             qq_int = int(qq_str)
         except ValueError:
