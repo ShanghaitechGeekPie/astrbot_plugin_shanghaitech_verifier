@@ -1,0 +1,14 @@
+{
+  "2024000001": {
+    "name": "张三",
+    "email": "zhangsan@shanghaitech.edu.cn",
+    "category": "本科生",
+    "count": 0
+  },
+  "2024000002": {
+    "name": "李四",
+    "email": "lisi@shanghaitech.edu.cn",
+    "category": "研究生",
+    "count": 0
+  }
+}

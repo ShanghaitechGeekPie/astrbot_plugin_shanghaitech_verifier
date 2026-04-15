@@ -14,8 +14,8 @@ from astrbot.api.star import Context, Star, register
 GRAD_VERIFY_MESSAGE = (
     "【学号验证】\n"
     "您好，您所在的选课群正在进行成员验证。\n"
-    "请回复您的 10 位学号以完成验证。\n"
-    "例如：2020000001\n"
+    "请回复 /验证 <学号> 以完成验证。\n"
+    "例如：/验证 2020000001\n"
     "如有疑问请联系群管理员。"
 )
 
@@ -487,17 +487,17 @@ class ShanghaiTechVerifierPlugin(Star):
             return
 
         text = str(raw.get("raw_message", "") or event.message_str or "").strip()
-        student_id = self._extract_student_id(text)
-
-        if not student_id:
+        verify_match = re.search(r"/验证\s*(\d{10})\b", text)
+        if not verify_match:
             try:
                 await event.bot.send_private_msg(
                     user_id=int(sender_qq),
-                    message="未识别到学号，请回复您的 10 位学号。",
+                    message="请使用正确格式：/验证 <10位学号>\n例如：/验证 2020000001",
                 )
             except Exception:
                 pass
             return
+        student_id = verify_match.group(1)
 
         graduated = self._read_graduated()
         used = state.get("used_student_ids", {})
