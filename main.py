@@ -1,6 +1,8 @@
+import asyncio
 import glob
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +10,14 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Node, Plain
 from astrbot.api.star import Context, Star, register
+
+GRAD_VERIFY_MESSAGE = (
+    "【学号验证】\n"
+    "您好，您所在的选课群正在进行成员验证。\n"
+    "请回复您的 10 位学号以完成验证。\n"
+    "例如：2020000001\n"
+    "如有疑问请联系群管理员。"
+)
 
 
 @register(
@@ -27,6 +37,11 @@ class ShanghaiTechVerifierPlugin(Star):
         self.admin_group = str(self.config.get("admin_group", "") or "").strip()
         self.managed_group = str(self.config.get("managed_group", "") or "").strip()
         self.debug_log = bool(self.config.get("debug_log", True))
+        self.graduated_path = self.data_dir / "graduated.json"
+        self.grad_state_path = self.data_dir / "grad_verify_state.json"
+        self._task_running = False
+        self._verify_task: asyncio.Task | None = None
+        self._bot = None
 
     def _debug(self, message: str) -> None:
         if self.debug_log:
@@ -46,6 +61,13 @@ class ShanghaiTechVerifierPlugin(Star):
             self._write_students_index(self._dummy_students_index())
         else:
             self._debug(f"[initialize] students index ready at {self.students_path}")
+        if not self.graduated_path.exists():
+            self._debug("[initialize] graduated.json not found, creating empty")
+            with self.graduated_path.open("w", encoding="utf-8") as f:
+                json.dump({}, f, ensure_ascii=False, indent=2)
+        if not self.grad_state_path.exists():
+            self._debug("[initialize] grad_verify_state.json not found, creating default")
+            self._write_grad_state({"users": {}, "used_student_ids": {}, "task_enabled": False})
 
     # ── static helpers ──────────────────────────────────────────────
 
@@ -100,6 +122,37 @@ class ShanghaiTechVerifierPlugin(Star):
         with self.students_path.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         self._debug(f"[_write_students_index] wrote entries={len(data.keys())}")
+
+    # ── graduated.json & grad_verify_state.json I/O ─────────────────
+
+    def _read_graduated(self) -> dict[str, dict[str, Any]]:
+        if not self.graduated_path.exists():
+            return {}
+        try:
+            with self.graduated_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as err:
+            logger.error(f"读取 graduated.json 失败: {err}")
+        return {}
+
+    def _read_grad_state(self) -> dict[str, Any]:
+        default = {"users": {}, "used_student_ids": {}, "task_enabled": False}
+        if not self.grad_state_path.exists():
+            return default
+        try:
+            with self.grad_state_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as err:
+            logger.error(f"读取 grad_verify_state.json 失败: {err}")
+        return default
+
+    def _write_grad_state(self, data: dict[str, Any]) -> None:
+        with self.grad_state_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     # ── whitelist (verified QQ) ─────────────────────────────────────
 
@@ -341,6 +394,164 @@ class ShanghaiTechVerifierPlugin(Star):
             reason=combined_reason,
         )
 
+    # ── graduation verification loop ────────────────────────────────
+
+    async def _verification_loop(self):
+        self._debug("[_verification_loop] started")
+        while self._task_running:
+            try:
+                await self._send_next_verification()
+            except Exception as err:
+                logger.error(f"[_verification_loop] error: {err}")
+            await asyncio.sleep(3600)
+        self._debug("[_verification_loop] stopped")
+
+    async def _send_next_verification(self):
+        if not self.current_path.exists():
+            self._debug("[_send_next_verification] current.json not found, skip")
+            return
+        try:
+            with self.current_path.open("r", encoding="utf-8") as f:
+                current = json.load(f)
+        except Exception as err:
+            logger.error(f"[_send_next_verification] read current.json failed: {err}")
+            return
+
+        current_members = current.get("data", [])
+        verified = self._load_verified_qq_ids()
+        state = self._read_grad_state()
+        users = state.setdefault("users", {})
+
+        for m in current_members:
+            uid = m.get("user_id")
+            if uid is None:
+                continue
+            uid_int = int(uid)
+            qq_str = str(uid_int)
+
+            if uid_int in verified:
+                continue
+            user_state = users.get(qq_str, {})
+            status = user_state.get("status")
+            if status in ("verified", "sent"):
+                continue
+
+            # This user needs a verification message
+            try:
+                await self._bot.send_private_msg(user_id=uid_int, message=GRAD_VERIFY_MESSAGE)
+                users[qq_str] = {
+                    "status": "sent",
+                    "student_id": None,
+                    "sent_at": datetime.now(timezone.utc).isoformat(),
+                    "verified_at": None,
+                    "reason": "",
+                }
+                state["users"] = users
+                self._write_grad_state(state)
+                self._debug(f"[_send_next_verification] sent to {qq_str}")
+                return  # one per cycle
+            except Exception as err:
+                logger.error(f"[_send_next_verification] failed to send to {qq_str}: {err}")
+                users[qq_str] = {
+                    "status": "failed",
+                    "student_id": None,
+                    "sent_at": datetime.now(timezone.utc).isoformat(),
+                    "verified_at": None,
+                    "reason": f"无法发送私聊消息: {err}",
+                }
+                state["users"] = users
+                self._write_grad_state(state)
+                # continue to next user
+
+        self._debug("[_send_next_verification] no more users to verify this cycle")
+
+    # ── private message reply handler ─────────────────────────────
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_private_verify_reply(self, event: AstrMessageEvent):
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if raw.get("post_type") != "message" or raw.get("message_type") != "private":
+            return
+
+        sender_qq = str(raw.get("user_id", ""))
+        if not sender_qq:
+            return
+
+        state = self._read_grad_state()
+        users = state.get("users", {})
+        user_state = users.get(sender_qq, {})
+        if user_state.get("status") != "sent":
+            return
+
+        text = str(raw.get("raw_message", "") or event.message_str or "").strip()
+        student_id = self._extract_student_id(text)
+
+        if not student_id:
+            try:
+                await event.bot.send_private_msg(
+                    user_id=int(sender_qq),
+                    message="未识别到学号，请回复您的 10 位学号。",
+                )
+            except Exception:
+                pass
+            return
+
+        graduated = self._read_graduated()
+        used = state.get("used_student_ids", {})
+
+        if student_id not in graduated:
+            user_state["status"] = "failed"
+            user_state["reason"] = f"学号 {student_id} 不在毕业生名单中"
+            users[sender_qq] = user_state
+            state["users"] = users
+            self._write_grad_state(state)
+            try:
+                await event.bot.send_private_msg(
+                    user_id=int(sender_qq),
+                    message=f"验证失败：学号 {student_id} 不在毕业生名单中，请联系管理员。",
+                )
+            except Exception:
+                pass
+            return
+
+        if student_id in used and used[student_id] != sender_qq:
+            user_state["status"] = "failed"
+            user_state["reason"] = f"学号 {student_id} 已绑定其他 QQ"
+            users[sender_qq] = user_state
+            state["users"] = users
+            self._write_grad_state(state)
+            try:
+                await event.bot.send_private_msg(
+                    user_id=int(sender_qq),
+                    message=f"验证失败：学号 {student_id} 已绑定其他 QQ，请联系管理员。",
+                )
+            except Exception:
+                pass
+            return
+
+        # Verification passed
+        now = datetime.now(timezone.utc).isoformat()
+        user_state["status"] = "verified"
+        user_state["student_id"] = student_id
+        user_state["verified_at"] = now
+        user_state["reason"] = ""
+        users[sender_qq] = user_state
+        used[student_id] = sender_qq
+        state["users"] = users
+        state["used_student_ids"] = used
+        self._write_grad_state(state)
+        self._debug(f"[on_private_verify_reply] {sender_qq} verified with {student_id}")
+        try:
+            await event.bot.send_private_msg(
+                user_id=int(sender_qq),
+                message="验证成功！感谢您的配合。",
+            )
+        except Exception:
+            pass
+
     # ── admin group commands ────────────────────────────────────────
 
     def _is_admin_group(self, event: AstrMessageEvent) -> bool:
@@ -358,7 +569,10 @@ class ShanghaiTechVerifierPlugin(Star):
             "【ShanghaiTech 群助手】\n"
             "/帮助 - 显示本帮助\n"
             "/扫描成员 - 扫描选课群成员并与认证名单比对\n"
-            "/查询 <QQ号> - 查询指定 QQ 是否已认证及入群状态"
+            "/查询 <QQ号> - 查询指定 QQ 是否已认证及入群状态\n"
+            "/开始任务 - 启动毕业生验证（需先扫描成员）\n"
+            "/暂停任务 - 暂停毕业生验证任务\n"
+            "/任务状态 - 查看验证任务进度与统计"
         )
         yield event.plain_result(help_text)
 
@@ -509,5 +723,96 @@ class ShanghaiTechVerifierPlugin(Star):
 
         yield event.plain_result("\n".join(lines))
 
+    @filter.command("开始任务")
+    async def cmd_start_task(self, event: AstrMessageEvent):
+        """启动毕业生验证任务"""
+        if not self._is_admin_group(event):
+            return
+
+        if not self.current_path.exists():
+            yield event.plain_result("请先执行 /扫描成员 获取群成员列表。")
+            return
+
+        self._bot = event.bot
+        self._task_running = True
+        state = self._read_grad_state()
+        state["task_enabled"] = True
+        self._write_grad_state(state)
+        self._verify_task = asyncio.create_task(self._verification_loop())
+        yield event.plain_result("毕业生验证任务已启动，每小时发送一条验证消息。")
+
+    @filter.command("暂停任务")
+    async def cmd_stop_task(self, event: AstrMessageEvent):
+        """暂停毕业生验证任务"""
+        if not self._is_admin_group(event):
+            return
+
+        self._task_running = False
+        if self._verify_task and not self._verify_task.done():
+            self._verify_task.cancel()
+        self._verify_task = None
+        state = self._read_grad_state()
+        state["task_enabled"] = False
+        self._write_grad_state(state)
+        yield event.plain_result("毕业生验证任务已暂停。")
+
+    @filter.command("任务状态")
+    async def cmd_task_status(self, event: AstrMessageEvent):
+        """查看毕业生验证任务状态"""
+        if not self._is_admin_group(event):
+            return
+
+        state = self._read_grad_state()
+        users = state.get("users", {})
+        enabled = state.get("task_enabled", False)
+
+        counts = {"pending": 0, "sent": 0, "verified": 0, "failed": 0}
+        verified_list: list[str] = []
+        unverified_list: list[str] = []
+        failed_list: list[str] = []
+
+        for qq, info in users.items():
+            status = info.get("status", "pending")
+            counts[status] = counts.get(status, 0) + 1
+            if status == "verified":
+                sid = info.get("student_id", "?")
+                verified_list.append(f"{qq} - 学号 {sid}")
+            elif status == "sent":
+                unverified_list.append(f"{qq} - 已发送待回复")
+            elif status == "failed":
+                reason = info.get("reason", "未知")
+                failed_list.append(f"{qq} - {reason}")
+
+        bot_id = str(getattr(event.bot, "qq", 0) or 10000)
+        bot_name = "群助手"
+
+        summary = (
+            f"【毕业生验证任务状态】\n"
+            f"任务状态: {'运行中' if enabled and self._task_running else '已暂停'}\n"
+            f"待处理: {counts['pending']}\n"
+            f"已发送: {counts['sent']}\n"
+            f"已验证: {counts['verified']}\n"
+            f"失败: {counts['failed']}"
+        )
+        node_summary = Node(uin=bot_id, name=bot_name, content=[Plain(summary)])
+
+        verified_text = f"【已验证 ({counts['verified']})】\n" + ("\n".join(verified_list) or "无")
+        node_verified = Node(uin=bot_id, name=bot_name, content=[Plain(verified_text)])
+
+        other_lines = []
+        if unverified_list:
+            other_lines.append(f"【待回复 ({counts['sent']})】")
+            other_lines.extend(unverified_list)
+        if failed_list:
+            other_lines.append(f"\n【失败 ({counts['failed']})】")
+            other_lines.extend(failed_list)
+        other_text = "\n".join(other_lines) if other_lines else "无未验证/失败记录"
+        node_other = Node(uin=bot_id, name=bot_name, content=[Plain(other_text)])
+
+        yield event.chain_result([node_summary, node_verified, node_other])
+
     async def terminate(self):
-        return
+        self._task_running = False
+        if self._verify_task and not self._verify_task.done():
+            self._verify_task.cancel()
+        self._verify_task = None
